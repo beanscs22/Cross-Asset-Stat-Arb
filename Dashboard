@@ -1,0 +1,894 @@
+from datetime import datetime, timezone
+import math
+import matplotlib.pyplot as plt
+import numpy as np
+import requests
+import streamlit as st
+from scipy.optimize import least_squares
+from scipy.special import expit, ndtr
+
+
+KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
+DERIBIT_API = "https://www.deribit.com/api/v2"
+YEAR_SECONDS = 365.25 * 24 * 60 * 60
+
+st.set_page_config(page_title="Kalshi–Deribit Paper Monitor", layout="wide")
+st.title("Kalshi–Deribit BTC Paper Monitor")
+st.caption("Read-only market data · simulated payoff analysis · no orders placed")
+
+
+def get_json(url, params=None):
+    response = requests.get(url, params=params, timeout=25)
+    response.raise_for_status()
+    data = response.json()
+    if data.get("error"):
+        raise RuntimeError(f"API error: {data['error']}")
+    return data
+
+
+def get_kalshi_market(ticker):
+    data = get_json(f"{KALSHI_API}/markets/{ticker}")
+    return data.get("market", data)
+
+
+def read_kalshi_price(market, dollars_field, cents_field):
+    value = market.get(dollars_field)
+    if value is not None:
+        return float(value)
+    value = market.get(cents_field)
+    return float(value) / 100 if value is not None else None
+
+
+def get_deribit_options():
+    instrument_data = get_json(
+        f"{DERIBIT_API}/public/get_instruments",
+        {"currency": "BTC", "kind": "option", "expired": "false"},
+    )
+    instruments = {
+        item["instrument_name"]: item
+        for item in instrument_data.get("result", [])
+    }
+
+    summary_data = get_json(
+        f"{DERIBIT_API}/public/get_book_summary_by_currency",
+        {"currency": "BTC", "kind": "option"},
+    )
+
+    now = datetime.now(timezone.utc).timestamp()
+    rows = []
+    for quote in summary_data.get("result", []):
+        instrument = instruments.get(quote.get("instrument_name"))
+        if not instrument:
+            continue
+        try:
+            expiry_ts = float(instrument["expiration_timestamp"]) / 1000
+            years = (expiry_ts - now) / YEAR_SECONDS
+            strike = float(instrument["strike"])
+            iv = float(quote["mark_iv"]) / 100
+            forward = float(quote["underlying_price"])
+            if years <= 0 or strike <= 0 or iv <= 0 or forward <= 0:
+                continue
+
+            rows.append({
+                "name": quote["instrument_name"],
+                "option_type": instrument["option_type"],
+                "expiry_ts": expiry_ts,
+                "years": years,
+                "strike": strike,
+                "log_moneyness": math.log(strike / forward),
+                "total_variance": iv * iv * years,
+                "iv": iv,
+                "forward": forward,
+                "bid": quote.get("bid_price"),
+                "ask": quote.get("ask_price"),
+            })
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            continue
+
+    if len(rows) < 10:
+        raise RuntimeError(
+            f"Only {len(rows)} usable Deribit option quotes found; need 10."
+        )
+    return rows
+
+
+def fit_ssvi(rows):
+    expiries = np.array(sorted({row["expiry_ts"] for row in rows}))
+    expiry_idx = np.searchsorted(
+        expiries, [row["expiry_ts"] for row in rows]
+    )
+    k = np.array([row["log_moneyness"] for row in rows])
+    w = np.array([row["total_variance"] for row in rows])
+
+    def unpack(params):
+        rho = 0.999 * np.tanh(params[0])
+        gamma = expit(params[1])
+
+        # Positive, increasing ATM total variance across expiries.
+        increments = np.exp(np.clip(params[3:3 + len(expiries)], -30, 10))
+        theta = np.cumsum(increments)
+
+        # Bound eta so the SSVI butterfly-arbitrage conditions hold.
+        one_plus_abs_rho = 1.0 + abs(rho)
+
+        a_values = (
+            theta ** (1.0 - gamma)
+            / (1.0 + theta) ** (1.0 - gamma)
+        )
+        b_values = (
+            theta ** (1.0 - 2.0 * gamma)
+            / (1.0 + theta) ** (2.0 - 2.0 * gamma)
+        )
+
+        eta_bound_a = 4.0 / (one_plus_abs_rho * np.max(a_values))
+        eta_bound_b = np.sqrt(
+            4.0 / (one_plus_abs_rho * np.max(b_values))
+        )
+        eta_max = min(eta_bound_a, eta_bound_b)
+
+        # Strictly stay inside the first bound.
+        eta = 0.999 * eta_max * expit(params[2])
+        return rho, gamma, eta, theta
+
+    def ssvi_variance(k_values, theta_values, rho, gamma, eta):
+        phi = eta / (
+            theta_values**gamma
+            * (1.0 + theta_values)**(1.0 - gamma)
+        )
+        return 0.5 * theta_values * (
+            1.0
+            + rho * phi * k_values
+            + np.sqrt((phi * k_values + rho)**2 + 1.0 - rho**2)
+        )
+
+    def residuals(params):
+        rho, gamma, eta, theta = unpack(params)
+        return (
+            ssvi_variance(k, theta[expiry_idx], rho, gamma, eta) - w
+        )
+
+    initial = np.r_[
+        np.arctanh(-0.3 / 0.999),
+        0.0,
+        0.0,
+        np.log(np.full(len(expiries), 0.02)),
+    ]
+
+    result = least_squares(
+        residuals,
+        initial,
+        max_nfev=20_000,
+    )
+
+    rho, gamma, eta, theta = unpack(result.x)
+    return expiries, theta, rho, gamma, eta, ssvi_variance, result
+
+def fitted_call_prices(strikes, forward, expiry_years, theta,
+                       rho, gamma, eta, variance_fn):
+    """Undiscounted Black-76 call prices using SSVI IV at each strike."""
+    strikes = np.asarray(strikes, dtype=float)
+    log_moneyness = np.log(strikes / forward)
+
+    total_variance = np.asarray(variance_fn(
+        log_moneyness,
+        np.full_like(log_moneyness, theta),
+        rho,
+        gamma,
+        eta,
+    ), dtype=float)
+
+    total_variance = np.maximum(total_variance, 1e-14)
+    root_w = np.sqrt(total_variance)
+
+    d1 = (np.log(forward / strikes) + 0.5 * total_variance) / root_w
+    d2 = d1 - root_w
+
+    return forward * ndtr(d1) - strikes * ndtr(d2)
+
+if "simulator_view" not in st.session_state:
+    st.session_state.simulator_view = "market"
+
+if "simulated_positions" not in st.session_state:
+    st.session_state.simulated_positions = []
+
+with st.sidebar:
+    st.header("Market Settings")
+    if st.button("Open simulated position workspace"):
+        st.session_state.simulator_view = "workspace"
+        st.rerun()
+    ticker = st.text_input(
+        "Kalshi market ticker", "KXBTCD-26NOV2017-T63499.99"
+    )
+    threshold = st.number_input(
+        "BTC threshold (USD)", min_value=1.0, value=63499.99, step=100.0
+    )
+    resolution_text = st.text_input(
+        "Kalshi resolution time (UTC)", "2026-11-20T22:00:00Z"
+    )
+    contracts = st.number_input(
+        "Kalshi contracts to graph", min_value=1, value=10, step=1
+    )
+    fees_per_package = st.number_input(
+        "Estimated fees/slippage per NO + spread ($)",
+        min_value=0.0, value=0.0, step=0.01,
+    )
+    if st.button("Refresh live data"):
+        st.rerun()
+
+if st.session_state.simulator_view == "workspace":
+    st.header("Simulated position workspace")
+    st.caption("Paper P/L only. No orders are placed.")
+
+    if st.button("← Back to market analysis"):
+        st.session_state.simulator_view = "market"
+        st.rerun()
+
+    with st.form("add_simulated_position", clear_on_submit=True):
+        instrument_type = st.selectbox(
+            "Contract type",
+            ["Kalshi contract", "Deribit option"],
+        )
+        contract_name = st.text_input(
+            "Contract ticker / option instrument name"
+        )
+        side = st.selectbox("Position side", ["Long", "Short"])
+
+        outcome = None
+        if instrument_type == "Kalshi contract":
+            outcome = st.selectbox("Kalshi outcome", ["YES", "NO"])
+            quantity = st.number_input(
+                "Contracts",
+                min_value=1,
+                value=1,
+                step=1,
+            )
+        else:
+            outcome = None
+            quantity = st.number_input(
+                "Option amount (BTC)",
+                min_value=0.000001,
+                value=0.01,
+                step=0.001,
+                format="%.6f",
+            )
+
+        avg_cost = st.number_input(
+            "Average cost ($ per contract/unit)",
+            min_value=0.0,
+            value=0.0,
+            step=0.01,
+            format="%.6f",
+        )
+        manual_price = st.number_input(
+            "Manual price ($) fallback if live quote is unavailable",
+            min_value=0.0,
+            value=0.0,
+            step=0.01,
+            format="%.6f",
+        )
+
+        add_position = st.form_submit_button("Add simulated position")
+
+    if add_position:
+        if not contract_name.strip():
+            st.error("Enter a Kalshi ticker or Deribit instrument name.")
+        else:
+            st.session_state.simulated_positions.append({
+                "type": instrument_type,
+                "contract": contract_name.strip(),
+                "outcome": outcome,
+                "side": side,
+                "quantity": quantity,
+                "avg_cost": avg_cost,
+                "manual_price": manual_price,
+            })
+
+    positions = st.session_state.simulated_positions
+
+    if st.button("Refresh live P/L"):
+        st.rerun()
+
+    if st.button("Clear all simulated positions"):
+        st.session_state.simulated_positions = []
+        st.rerun()
+
+    if not positions:
+        st.info("No simulated positions yet. Add one using the form above.")
+    else:
+        option_rows = []
+        if any(p["type"] == "Deribit option" for p in positions):
+            try:
+                option_rows = get_deribit_options()
+            except (requests.RequestException, RuntimeError) as exc:
+                st.warning(f"Could not refresh Deribit quotes: {exc}")
+
+        display_rows = []
+        total_pnl = 0.0
+
+        for position in positions:
+            live_mark = None
+            source = "Manual fallback"
+
+            try:
+                if position["type"] == "Kalshi contract":
+                    market = get_kalshi_market(position["contract"])
+                    outcome = position["outcome"].lower()
+
+                    bid = read_kalshi_price(
+                        market, f"{outcome}_bid_dollars", f"{outcome}_bid"
+                    )
+                    ask = read_kalshi_price(
+                        market, f"{outcome}_ask_dollars", f"{outcome}_ask"
+                    )
+
+                    if bid is not None and ask is not None:
+                        live_mark = (bid + ask) / 2
+                    elif bid is not None:
+                        live_mark = bid
+                    elif ask is not None:
+                        live_mark = ask
+
+                    source = "Kalshi bid/ask mark"
+
+                else:
+                    quote = next(
+                        (
+                            row for row in option_rows
+                            if row["name"] == position["contract"]
+                        ),
+                        None,
+                    )
+
+                    if quote is not None:
+                        bid = quote["bid"]
+                        ask = quote["ask"]
+
+                        if bid is not None and ask is not None:
+                            mark_btc = (bid + ask) / 2
+                        elif bid is not None:
+                            mark_btc = bid
+                        elif ask is not None:
+                            mark_btc = ask
+                        else:
+                            mark_btc = None
+
+                        if mark_btc is not None:
+                            live_mark = mark_btc * quote["forward"]
+                            source = "Deribit midpoint converted to USD"
+
+            except (requests.RequestException, RuntimeError, KeyError, ValueError) as exc:
+                source = f"Live quote failed: {exc}"
+
+            if live_mark is None and position["manual_price"] > 0:
+                live_mark = position["manual_price"]
+
+            if live_mark is None:
+                pnl = None
+                status = "No live quote or manual fallback"
+            else:
+                sign = 1 if position["side"] == "Long" else -1
+                pnl = (
+                    sign
+                    * (live_mark - position["avg_cost"])
+                    * position["quantity"]
+                )
+                total_pnl += pnl
+                status = source
+
+            display_rows.append({
+                "Type": position["type"],
+                "Contract": position["contract"],
+                "Outcome": position["outcome"] or "—",
+                "Side": position["side"],
+                "Live mark ($)": live_mark,
+                "Contracts / amount": position["quantity"],
+                "Average cost ($)": position["avg_cost"],
+                "P/L ($)": pnl,
+                "Price source": status,
+            })
+
+        st.dataframe(display_rows, use_container_width=True)
+        st.metric("Total simulated P/L", f"${total_pnl:+,.2f}")
+        st.caption(
+            "P/L is mark-to-average-cost, before fees and slippage. For Deribit "
+            "BTC options, enter the option amount in BTC; the live premium is "
+            "converted to USD using the quote’s underlying price."
+        )
+
+    st.stop()
+
+try:
+    resolution = datetime.fromisoformat(
+        resolution_text.replace("Z", "+00:00")
+    )
+    if resolution.tzinfo is None:
+        raise ValueError("Include a timezone, such as a trailing Z for UTC.")
+    resolution = resolution.astimezone(timezone.utc)
+
+    market = get_kalshi_market(ticker)
+    yes_ask = read_kalshi_price(market, "yes_ask_dollars", "yes_ask")
+    no_ask = read_kalshi_price(market, "no_ask_dollars", "no_ask")
+    yes_bid = read_kalshi_price(market, "yes_bid_dollars", "yes_bid")
+    no_bid = read_kalshi_price(market, "no_bid_dollars", "no_bid")
+    if yes_ask is None and no_bid is not None:
+        yes_ask = 1 - no_bid
+    if no_ask is None and yes_bid is not None:
+        no_ask = 1 - yes_bid
+
+    rows = get_deribit_options()
+    expiries, theta, rho, gamma, eta, variance_fn, fit = fit_ssvi(rows)
+    target_ts = resolution.timestamp()
+    idx = int(np.argmin(np.abs(expiries - target_ts)))
+    expiry_ts = float(expiries[idx])
+    expiry_rows = [row for row in rows if row["expiry_ts"] == expiry_ts]
+    forward = float(np.median([row["forward"] for row in expiry_rows]))
+    years = (expiry_ts - datetime.now(timezone.utc).timestamp()) / YEAR_SECONDS
+    if years <= 0:
+        raise RuntimeError("Selected Deribit expiry has passed.")
+
+        
+    #  Q(S_T > K) = -dC/dK
+        # Breeden–Litzenberger estimate: Q(S_T > K) ≈ -dC/dK
+    bump = max(threshold * 1e-4, 1.0)
+    theta_used = float(theta[idx])
+
+    phi_used = eta / (
+        theta_used**gamma * (1.0 + theta_used)**(1.0 - gamma)
+    )
+    bound_1 = theta_used * phi_used * (1.0 + abs(rho))
+    bound_2 = theta_used * phi_used**2 * (1.0 + abs(rho))
+
+    c_lower = float(fitted_call_prices(
+        [threshold - bump], forward, years, theta_used,
+        rho, gamma, eta, variance_fn,
+    )[0])
+    c_upper = float(fitted_call_prices(
+        [threshold + bump], forward, years, theta_used,
+        rho, gamma, eta, variance_fn,
+    )[0])
+
+    q_yes = (c_lower - c_upper) / (2.0 * bump)
+    q_no = 1.0 - q_yes
+    q_valid = np.isfinite(q_yes) and 0.0 <= q_yes <= 1.0
+
+    st.write("BL and SSVI diagnostics", {
+        "C(K-bump)": c_lower,
+        "C(K+bump)": c_upper,
+        "bump": bump,
+        "raw BL Q(YES)": q_yes,
+        "SSVI bound 1 (must be < 4)": bound_1,
+        "SSVI bound 2 (must be <= 4)": bound_2,
+    })
+
+
+    st.subheader("Live market comparison")
+    st.write(f"**Market:** {market.get('title', ticker)}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Kalshi YES bid / ask", f"{yes_bid} / {yes_ask}")
+    c2.metric("Kalshi NO bid / ask", f"{no_bid} / {no_ask}")
+    c3.metric("SSVI Q(YES)", f"{q_yes:.2%}")
+    c4.metric("SSVI Q(YES) − YES ask", f"{q_yes - yes_ask:+.2%}" if yes_ask is not None else "N/A")
+    st.write(
+        f"Deribit expiry used: **{datetime.fromtimestamp(expiry_ts, timezone.utc).isoformat()}**  "
+        f"· expiry minus Kalshi resolution: **{(expiry_ts - target_ts) / 86400:+.2f} days**"
+    )
+    st.caption(
+        f"SSVI converged: {fit.success} · total-variance RMSE: "
+        f"{np.sqrt(np.mean(fit.fun ** 2)):.6g}. Q is risk-neutral, not a forecast."
+    )
+
+    quoted_calls = [
+        row for row in expiry_rows
+        if row["option_type"] == "call"
+        and row["bid"] is not None
+        and row["ask"] is not None
+    ]
+
+    if quoted_calls:
+        curve_strikes = np.linspace(
+            min(row["strike"] for row in quoted_calls),
+            max(row["strike"] for row in quoted_calls),
+            300,
+        )
+    else:
+        curve_strikes = np.linspace(threshold * 0.8, threshold * 1.2, 300)
+
+    curve_prices = fitted_call_prices(
+        curve_strikes, forward, years, float(theta[idx]),
+        rho, gamma, eta, variance_fn,
+    )
+
+    call_curve_fig, call_curve_ax = plt.subplots(figsize=(10, 5))
+    call_curve_ax.plot(
+        curve_strikes, curve_prices,
+        label="SSVI-fitted Black-76 call curve",
+    )
+
+    if quoted_calls:
+        quote_strikes = np.array([row["strike"] for row in quoted_calls])
+        quote_mids_usd = np.array([
+            (row["bid"] + row["ask"]) * 0.5 * forward
+            for row in quoted_calls
+        ])
+        call_curve_ax.scatter(
+            quote_strikes, quote_mids_usd,
+            s=18, alpha=0.65,
+            label="Deribit call midquotes, converted from BTC",
+        )
+
+    call_curve_ax.axvline(
+        threshold, color="red", linestyle="--",
+        label=f"Threshold ${threshold:,.0f}",
+    )
+    call_curve_ax.set_xlabel("Strike K ($)")
+    call_curve_ax.set_ylabel("Call price ($)")
+    call_curve_ax.set_title("SSVI-fitted call-price curve")
+    call_curve_ax.grid(True, alpha=0.3)
+    call_curve_ax.legend()
+    call_curve_fig.tight_layout()
+
+    probability_tab, ssvi_tab, ev_tab = st.tabs(
+        ["Probability estimate", "SSVI options graph", "Expected value"]
+    )
+
+    with probability_tab:
+        st.metric("Raw BL Q(YES)", f"{q_yes:.6f}")
+        st.caption(
+            f"Forward: ${forward:,.2f} · "
+            f"Threshold: ${threshold:,.2f}"
+        )
+
+    with ssvi_tab:
+        st.pyplot(call_curve_fig, width="stretch")
+        slopes = np.diff(curve_prices) / np.diff(curve_strikes)
+        st.write("Fitted call-curve checks", {
+            "slope range": (float(slopes.min()), float(slopes.max())),
+            "non-increasing": bool(np.all(slopes <= 1e-5)),
+            "convex": bool(np.all(np.diff(slopes) >= -1e-4)),
+        })
+
+    if not q_valid:
+        st.error(
+            f"BL produced an invalid probability ({q_yes:.8f}); "
+            "the payoff screen is stopped."
+        )
+        st.stop()
+
+    calls = [
+        row for row in expiry_rows
+        if row["option_type"] == "call"
+        and row["bid"] is not None
+        and row["ask"] is not None
+    ]
+
+    ranked = []
+    best = None
+
+    # uses kalshi ask
+    if yes_ask is not None and q_yes > yes_ask:
+        direction = "buy_yes_short_spread"
+    elif yes_bid is not None and q_yes < yes_bid:
+        direction = "buy_no_long_spread"
+    else:
+        direction = None
+
+    if direction is None:
+        st.info(
+            "No directional trade signal at executable YES prices: "
+            "Q(YES) is inside or equal to the Kalshi YES bid/ask."
+        )
+    elif direction == "buy_no_long_spread" and no_ask is None:
+        st.warning("Cannot evaluate this direction because the Kalshi NO ask is unavailable.")
+        direction = None
+    elif not calls:
+        st.warning("No two-sided Deribit call quotes are available for this expiry.")
+        direction = None
+
+    if direction is not None:
+        # Find quoted strikes on either side of the Kalshi threshold.
+        pairs = [
+            (long_call, short_call)
+            for long_call in calls
+            for short_call in calls
+            if long_call["strike"] < threshold < short_call["strike"]
+        ]
+
+        for long_call, short_call in pairs:
+            k1 = long_call["strike"]
+            k2 = short_call["strike"]
+            width_strike = k2 - k1
+            spread_amount = 1.0 / width_strike
+
+            if direction == "buy_yes_short_spread":
+                option_cash = (
+                    spread_amount
+                    * (long_call["bid"] - short_call["ask"])
+                    * forward
+                )
+                entry_cost = yes_ask - option_cash + fees_per_package
+                trade_edge = option_cash - yes_ask - fees_per_package
+            else:
+                option_cash = (
+                    spread_amount
+                    * (long_call["ask"] - short_call["bid"])
+                    * forward
+                )
+                entry_cost = no_ask + option_cash + fees_per_package
+                trade_edge = 1.0 - entry_cost
+
+            prices = np.unique(np.r_[
+                np.linspace(k1 * 0.98, k2 * 1.02, 501),
+                threshold,
+                np.nextafter(threshold, np.inf),
+                k1,
+                k2,
+            ])
+
+            spread_payoff = spread_amount * (
+                np.maximum(prices - k1, 0)
+                - np.maximum(prices - k2, 0)
+            )
+
+            if direction == "buy_yes_short_spread":
+                kalshi_payoff = (prices > threshold).astype(float)
+                payoff = kalshi_payoff - spread_payoff
+            else:
+                kalshi_payoff = (prices <= threshold).astype(float)
+                payoff = kalshi_payoff + spread_payoff
+
+            profit = payoff - entry_cost
+
+            ranked.append({
+                "worst_case_profit": float(profit.min()),
+                "entry_cost": entry_cost,
+                "trade_edge": trade_edge,
+                "long": long_call,
+                "short": short_call,
+                "prices": prices,
+                "profit": profit,
+                "direction": direction,
+                "amount": spread_amount,
+            })
+
+        if not ranked:
+            st.warning("No quoted call spread straddles the Kalshi threshold.")
+        else:
+            # Keep the spread with the best sampled worst-case result.
+            positive_ranked = [
+                item for item in ranked
+                if item["trade_edge"] > 0
+            ]
+
+            if positive_ranked:
+                ranked = positive_ranked
+
+            ranked.sort(
+                key=lambda item: item["trade_edge"],
+                reverse=True,
+            )
+            best = ranked[0]
+
+            st.subheader("Directional paper screen")
+
+            if direction == "buy_yes_short_spread":
+                st.write(
+                    f"**Candidate:** Buy Kalshi YES at ask "
+                    f"{yes_ask:.4f}; sell **{best['long']['name']}** "
+                    f"at bid {best['long']['bid']:.6f} BTC; buy "
+                    f"**{best['short']['name']}** at ask "
+                    f"{best['short']['ask']:.6f} BTC."
+                )
+            else:
+                st.write(
+                    f"**Candidate:** Buy Kalshi NO at ask "
+                    f"{no_ask:.4f}; buy **{best['long']['name']}** "
+                    f"at ask {best['long']['ask']:.6f} BTC; sell "
+                    f"**{best['short']['name']}** at bid "
+                    f"{best['short']['bid']:.6f} BTC."
+                )
+
+            st.write(
+                f"Estimated executable edge outside the spread’s basis-risk "
+                f"band: **${best['trade_edge']:.4f} per package**."
+            )
+            st.write(
+                f"Sampled worst-case P/L: "
+                f"**${best['worst_case_profit']:.4f} per package**."
+            )
+
+            if best["trade_edge"] > 0:
+                st.success("The entered quotes show a positive paper-screen edge before settlement mismatch risk.")
+            else:
+                st.warning("The executable option quotes and fees do not leave a positive edge.")
+
+            spread_fig, spread_ax = plt.subplots(figsize=(8, 4.5))
+            spread_ax.plot(best["prices"], best["profit"])
+            spread_ax.axhline(0, color="black", linewidth=1)
+            spread_ax.axvline(
+                threshold, color="red", linestyle="--",
+                label="Kalshi threshold",
+            )
+            spread_ax.axvline(
+                best["long"]["strike"], color="gray", linestyle=":",
+                label="Call strikes",
+            )
+            spread_ax.axvline(
+                best["short"]["strike"], color="gray", linestyle=":",
+            )
+            spread_ax.set_xlabel("BTC price at settlement ($)")
+            spread_ax.set_ylabel("P/L per package ($)")
+            spread_ax.set_title(
+                "Kalshi YES + short spread"
+                if direction == "buy_yes_short_spread"
+                else "Kalshi NO + long spread"
+            )
+            spread_ax.grid(True, alpha=0.3)
+            spread_ax.legend()
+            spread_fig.tight_layout()
+    with ev_tab:
+        if best is None:
+            st.info("No quoted spread is available for an EV calculation.")
+        else:
+            model_calls = fitted_call_prices(
+                [best["long"]["strike"], best["short"]["strike"]],
+                forward,
+                years,
+                float(theta[idx]),
+                rho,
+                gamma,
+                eta,
+                variance_fn,
+            )
+            model_spread_value = best["amount"] * (
+                model_calls[0] - model_calls[1]
+            )
+
+            if best["direction"] == "buy_yes_short_spread":
+                expected_terminal_pnl = q_yes - model_spread_value
+                spread_credit = best["amount"] * (
+                    best["long"]["bid"] - best["short"]["ask"]
+                ) * forward
+                net_entry_pnl = (
+                    spread_credit - yes_ask - fees_per_package
+                )
+                st.write(
+                    f"1. Expected terminal P/L: Q(YES) "
+                    f"{q_yes:.4f} − model spread value "
+                    f"${model_spread_value:.4f} = "
+                    f"${expected_terminal_pnl:.4f}"
+                )
+                st.write(
+                    f"2. Net entry P/L: spread credit "
+                    f"${spread_credit:.4f} − YES ask "
+                    f"${yes_ask:.4f} − fees "
+                    f"${fees_per_package:.4f} = "
+                    f"${net_entry_pnl:.4f}"
+                )
+            else:
+                expected_terminal_pnl = q_no + model_spread_value
+                spread_debit = best["amount"] * (
+                    best["long"]["ask"] - best["short"]["bid"]
+                ) * forward
+                net_entry_pnl = -(
+                    no_ask + spread_debit + fees_per_package
+                )
+                st.write(
+                    f"1. Expected terminal P/L: Q(NO) "
+                    f"{q_no:.4f} + model spread value "
+                    f"${model_spread_value:.4f} = "
+                    f"${expected_terminal_pnl:.4f}"
+                )
+                st.write(
+                    f"2. Net entry P/L: −NO ask "
+                    f"${no_ask:.4f} − spread debit "
+                    f"${spread_debit:.4f} − fees "
+                    f"${fees_per_package:.4f} = "
+                    f"${net_entry_pnl:.4f}"
+                )
+
+            ev_per_package = expected_terminal_pnl + net_entry_pnl
+            st.write(
+                f"3. SSVI risk-neutral EV: "
+                f"${expected_terminal_pnl:.4f} + "
+                f"${net_entry_pnl:.4f} = "
+                f"**${ev_per_package:+.4f} per package**"
+            )
+            st.write(
+                f"4. For {contracts} packages: "
+                f"**${ev_per_package * contracts:+.4f}**"
+            )
+            st.caption(
+                "This is an SSVI risk-neutral estimate, not real-world EV. "
+                "It assumes a common settlement outcome and does not model "
+                "the expiry mismatch."
+            )       
+    # Second existing graph: Kalshi-only outcome P/L and SSVI model value.
+    labels, win_pnl, lose_pnl, model_values = [], [], [], []
+    for name, ask, probability in (
+        ("Buy YES", yes_ask, q_yes),
+        ("Buy NO", no_ask, q_no),
+    ):
+        if ask is None:
+            continue
+        labels.append(name)
+        win_pnl.append((1 - ask) * contracts)
+        lose_pnl.append(-ask * contracts)
+        model_values.append((probability - ask) * contracts)
+
+    x = np.arange(len(labels))
+    width = 0.25
+    kalshi_fig, kalshi_ax = plt.subplots(figsize=(8, 4.5))
+    kalshi_ax.bar(x - width, win_pnl, width, label="Contract wins")
+    kalshi_ax.bar(x, lose_pnl, width, label="Contract loses")
+    kalshi_ax.bar(x + width, model_values, width, label="SSVI model value")
+    kalshi_ax.axhline(0, color="black", linewidth=0.8)
+    kalshi_ax.set_xticks(x)
+    kalshi_ax.set_xticklabels(labels)
+    kalshi_ax.set_ylabel("P/L in dollars")
+    kalshi_ax.set_title(f"Kalshi-only scenarios ({contracts} contracts)")
+    kalshi_ax.legend()
+    kalshi_ax.grid(axis="y", alpha=0.25)
+    kalshi_fig.tight_layout()
+
+    payoff_tab, kalshi_tab, ev_tab = st.tabs(
+        ["Hedged payoff", "Kalshi-only scenarios", "Expected value"]
+    )
+
+    with payoff_tab:
+        if ranked:
+            st.pyplot(spread_fig, width="stretch")
+        else:
+            st.info("No quoted spread is available to graph.")
+
+    with kalshi_tab:
+        st.pyplot(kalshi_fig, width="stretch")
+
+    with ev_tab:
+        if best is None:
+            st.info("No quoted spread is available for an EV calculation.")
+        else:
+            model_calls = fitted_call_prices(
+                [best["long"]["strike"], best["short"]["strike"]],
+                forward,
+                years,
+                float(theta[idx]),
+                rho,
+                gamma,
+                eta,
+                variance_fn,
+            )
+            model_spread_value = best["amount"] * (
+                model_calls[0] - model_calls[1]
+            )
+
+            if best["direction"] == "buy_yes_short_spread":
+                expected_terminal_pnl = q_yes - model_spread_value
+                net_entry_pnl = best["trade_edge"]
+            else:
+                expected_terminal_pnl = q_no + model_spread_value
+                net_entry_pnl = -best["entry_cost"]
+
+            ev_per_package = expected_terminal_pnl + net_entry_pnl
+
+            st.metric(
+                "SSVI risk-neutral EV per package",
+                f"${ev_per_package:+.4f}",
+            )
+            st.metric(
+                f"SSVI risk-neutral EV for {contracts} packages",
+                f"${ev_per_package * contracts:+.4f}",
+            )
+            st.write({
+                "Model call-spread value": float(model_spread_value),
+                "Expected terminal P/L": float(expected_terminal_pnl),
+                "Net entry P/L": float(net_entry_pnl),
+            })
+            st.caption(
+                "This is an SSVI risk-neutral estimate. It assumes the legs "
+                "share a settlement outcome and does not model the expiry mismatch."
+            )
+
+except requests.RequestException as exc:
+    st.error(f"Network/API request failed: {exc}")
+except (ValueError, RuntimeError, KeyError, TypeError) as exc:
+    st.error(f"Could not complete comparison: {exc}")
