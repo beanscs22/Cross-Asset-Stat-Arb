@@ -832,6 +832,31 @@ try:
                 entry_cost = no_ask + option_cash + fees_per_package
                 trade_edge = 1.0 - entry_cost
 
+            model_calls = fitted_call_prices(
+                [k1, k2],
+                forward,
+                years,
+                float(theta[idx]),
+                rho,
+                gamma,
+                eta,
+                variance_fn,
+            )
+            model_spread_value = spread_amount * (
+                model_calls[0] - model_calls[1]
+            )
+
+            if direction == "buy_yes_short_spread":
+                expected_terminal_pnl = q_yes - model_spread_value
+                net_entry_pnl = option_cash - yes_ask - fees_per_package
+            else:
+                expected_terminal_pnl = q_no + model_spread_value
+                net_entry_pnl = -(
+                    no_ask + option_cash + fees_per_package
+                )
+
+            ev_per_package = expected_terminal_pnl + net_entry_pnl
+
             prices = np.unique(np.r_[
                 np.linspace(k1 * 0.98, k2 * 1.02, 501),
                 threshold,
@@ -864,22 +889,15 @@ try:
                 "profit": profit,
                 "direction": direction,
                 "amount": spread_amount,
+                "ev_per_package": float(ev_per_package),                
             })
 
         if not ranked:
             st.warning("No quoted call spread straddles the Kalshi threshold.")
         else:
             # Keep the spread with the best sampled worst-case result.
-            positive_ranked = [
-                item for item in ranked
-                if item["trade_edge"] > 0
-            ]
-
-            if positive_ranked:
-                ranked = positive_ranked
-
             ranked.sort(
-                key=lambda item: item["trade_edge"],
+                key=lambda item: item["ev_per_package"],
                 reverse=True,
             )
             best = ranked[0]
