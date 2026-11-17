@@ -6,7 +6,7 @@ import requests
 import streamlit as st
 from scipy.optimize import least_squares
 from scipy.special import expit, ndtr
-
+import re
 
 KALSHI_API = "https://api.elections.kalshi.com/trade-api/v2"
 DERIBIT_API = "https://www.deribit.com/api/v2"
@@ -30,6 +30,98 @@ def get_kalshi_market(ticker):
     data = get_json(f"{KALSHI_API}/markets/{ticker}")
     return data.get("market", data)
 
+def get_kalshi_event_markets(event_ticker):
+    markets = []
+    cursor = None
+
+    while True:
+        params = {"event_ticker": event_ticker, "limit": 1000}
+        if cursor:
+            params["cursor"] = cursor
+
+        payload = get_json(f"{KALSHI_API}/markets", params)
+        markets.extend(payload.get("markets", []))
+        cursor = payload.get("cursor")
+
+        if not cursor:
+            break
+
+    return markets
+
+
+def strike_number(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        cleaned = re.sub(r"[^0-9.\\-]", "", str(value))
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+
+def market_boundary(market_row):
+    strike_type = (market_row.get("strike_type") or "").lower()
+    floor = strike_number(market_row.get("floor_strike"))
+    cap = strike_number(market_row.get("cap_strike"))
+
+    ticker_match = re.search(
+        r"-T(-?\\d+(?:\\.\\d+)?)$",
+        market_row.get("ticker", ""),
+    )
+    ticker_strike = (
+        float(ticker_match.group(1)) if ticker_match else None
+    )
+
+    if strike_type == "between" or (floor is not None and cap is not None):
+        if floor is not None and cap is not None:
+            return "between", f"${floor:,.0f}–${cap:,.0f}", floor, cap
+        return None
+
+    if strike_type.startswith("less"):
+        strike = cap if cap is not None else floor
+        if strike is None:
+            strike = ticker_strike
+        if strike is not None:
+            return "below", f"< ${strike:,.0f}", None, strike
+        return None
+
+    if strike_type.startswith("greater"):
+        strike = floor if floor is not None else cap
+        if strike is None:
+            strike = ticker_strike
+        if strike is not None:
+            return "above", f"> ${strike:,.0f}", strike, None
+        return None
+
+    strike = floor if floor is not None else cap
+    if strike is None:
+        strike = ticker_strike
+    if strike is not None:
+        return "above", f"> ${strike:,.0f}", strike, None
+
+    return None
+
+
+def bl_q_above(strike, forward, years, theta_value,
+               rho, gamma, eta, variance_fn):
+    """Estimate Q(S_T > strike) as -dC/dK from fitted call prices."""
+    strike = float(strike)
+    bump = min(max(strike * 1e-4, 1.0), strike * 0.49)
+
+    calls = fitted_call_prices(
+        [strike - bump, strike + bump],
+        forward,
+        years,
+        theta_value,
+        rho,
+        gamma,
+        eta,
+        variance_fn,
+    )
+    return float((calls[0] - calls[1]) / (2.0 * bump))
 
 def read_kalshi_price(market, dollars_field, cents_field):
     value = market.get(dollars_field)
@@ -450,7 +542,111 @@ try:
     q_yes = (c_lower - c_upper) / (2.0 * bump)
     q_no = 1.0 - q_yes
     q_valid = np.isfinite(q_yes) and 0.0 <= q_yes <= 1.0
+    event_ticker = market.get("event_ticker")
+    if event_ticker:
+        event_markets = get_kalshi_event_markets(event_ticker)
+    else:
+        event_markets = [market]
 
+    # Make sure the market entered in the sidebar is included.
+    if not any(row.get("ticker") == ticker for row in event_markets):
+        event_markets.append(market)
+
+    option_strikes = [
+        row["strike"] for row in expiry_rows
+        if row["option_type"] == "call"
+    ]
+    min_option_strike = min(option_strikes) if option_strikes else None
+    max_option_strike = max(option_strikes) if option_strikes else None
+
+    boundary_rows = []
+
+    for event_market in event_markets:
+        parsed = market_boundary(event_market)
+        if parsed is None:
+            continue
+
+        boundary_kind, boundary_label, lower_strike, upper_strike = parsed
+
+        yes_bid_event = read_kalshi_price(
+            event_market, "yes_bid_dollars", "yes_bid"
+        )
+        yes_ask_event = read_kalshi_price(
+            event_market, "yes_ask_dollars", "yes_ask"
+        )
+        last_price = read_kalshi_price(
+            event_market, "last_price_dollars", "last_price"
+        )
+
+        if yes_bid_event is not None and yes_ask_event is not None:
+            kalshi_probability = (yes_bid_event + yes_ask_event) / 2
+            price_source = "YES bid/ask midpoint"
+        elif last_price is not None:
+            kalshi_probability = last_price
+            price_source = "last trade"
+        elif yes_bid_event is not None:
+            kalshi_probability = yes_bid_event
+            price_source = "YES bid only"
+        elif yes_ask_event is not None:
+            kalshi_probability = yes_ask_event
+            price_source = "YES ask only"
+        else:
+            continue
+
+        if boundary_kind == "above":
+            q_event = bl_q_above(
+                lower_strike, forward, years, theta_used,
+                rho, gamma, eta, variance_fn,
+            )
+        elif boundary_kind == "below":
+            q_event = 1.0 - bl_q_above(
+                upper_strike, forward, years, theta_used,
+                rho, gamma, eta, variance_fn,
+            )
+        else:  # Between the lower and upper strike
+            q_event = (
+                bl_q_above(
+                    lower_strike, forward, years, theta_used,
+                    rho, gamma, eta, variance_fn,
+                )
+                - bl_q_above(
+                    upper_strike, forward, years, theta_used,
+                    rho, gamma, eta, variance_fn,
+                )
+            )
+
+        boundary_strikes = [
+            strike for strike in (lower_strike, upper_strike)
+            if strike is not None
+        ]
+        within_option_range = (
+            min_option_strike is not None
+            and all(
+                min_option_strike <= strike <= max_option_strike
+                for strike in boundary_strikes
+            )
+        )
+        probability_valid = (
+            np.isfinite(q_event) and 0.0 <= q_event <= 1.0
+        )
+
+        boundary_rows.append({
+            "Boundary": boundary_label,
+            "Kalshi market": event_market.get("ticker", ""),
+            "Kalshi P(YES)": kalshi_probability,
+            "Kalshi price source": price_source,
+            "SSVI Q(YES)": q_event,
+            "Q − Kalshi P": q_event - kalshi_probability,
+            "Valid probability": probability_valid,
+            "Within option quote range": within_option_range,
+        })
+
+    boundary_rows.sort(
+        key=lambda row: row["Kalshi P(YES)"]
+    )
+    valid_boundary_rows = [
+        row for row in boundary_rows if row["Valid probability"]
+    ]
     st.write("BL and SSVI diagnostics", {
         "C(K-bump)": c_lower,
         "C(K+bump)": c_upper,
@@ -537,6 +733,17 @@ try:
             f"Forward: ${forward:,.2f} · "
             f"Threshold: ${threshold:,.2f}"
         )
+        st.subheader("All boundaries in this Kalshi event")
+        
+        if boundary_rows:
+            st.dataframe(
+                boundary_rows,
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No boundary markets with usable YES prices were found.")        
+        
 
     with ssvi_tab:
         st.pyplot(call_curve_fig, width="stretch")
@@ -552,7 +759,7 @@ try:
             f"BL produced an invalid probability ({q_yes:.8f}); "
             "the payoff screen is stopped."
         )
-        st.stop()
+    
 
     calls = [
         row for row in expiry_rows
@@ -563,6 +770,15 @@ try:
 
     ranked = []
     best = None
+
+    if not q_valid:
+        direction = None
+    elif yes_ask is not None and q_yes > yes_ask:
+        direction = "buy_yes_short_spread"
+    elif yes_bid is not None and q_yes < yes_bid:
+        direction = "buy_no_long_spread"
+    else:
+        direction = None
 
     # uses kalshi ask
     if yes_ask is not None and q_yes > yes_ask:
@@ -767,31 +983,7 @@ try:
                 st.success("The entered quotes show a positive paper-screen edge before settlement mismatch risk.")
             else:
                 st.warning("The executable option quotes and fees do not leave a positive edge.")
-
-            spread_fig, spread_ax = plt.subplots(figsize=(8, 4.5))
-            spread_ax.plot(best["prices"], best["profit"])
-            spread_ax.axhline(0, color="black", linewidth=1)
-            spread_ax.axvline(
-                threshold, color="red", linestyle="--",
-                label="Kalshi threshold",
-            )
-            spread_ax.axvline(
-                best["long"]["strike"], color="gray", linestyle=":",
-                label="Call strikes",
-            )
-            spread_ax.axvline(
-                best["short"]["strike"], color="gray", linestyle=":",
-            )
-            spread_ax.set_xlabel("BTC price at settlement ($)")
-            spread_ax.set_ylabel("P/L per package ($)")
-            spread_ax.set_title(
-                "Kalshi YES + short spread"
-                if direction == "buy_yes_short_spread"
-                else "Kalshi NO + long spread"
-            )
-            spread_ax.grid(True, alpha=0.3)
-            spread_ax.legend()
-            spread_fig.tight_layout()
+    
     with ev_tab:
         if best is None:
             st.info("No quoted spread is available for an EV calculation.")
@@ -897,15 +1089,45 @@ try:
     kalshi_ax.grid(axis="y", alpha=0.25)
     kalshi_fig.tight_layout()
 
-    payoff_tab, kalshi_tab, ev_tab = st.tabs(
-        ["Hedged payoff", "Kalshi-only scenarios", "Expected value"]
+    boundary_tab, kalshi_tab, ev_tab = st.tabs(
+        ["Kalshi odds vs SSVI Q(YES)", "Kalshi-only scenarios", "Expected value"]
     )
 
-    with payoff_tab:
-        if ranked:
-            st.pyplot(spread_fig, width="stretch")
+    with boundary_tab:
+        if not valid_boundary_rows:
+            st.info("No valid SSVI boundary probabilities to plot.")
         else:
-            st.info("No quoted spread is available to graph.")
+            fig, ax = plt.subplots(figsize=(8, 6))
+
+            kalshi_x = [
+                row["Kalshi P(YES)"] for row in valid_boundary_rows
+            ]
+            ssvi_y = [
+                row["SSVI Q(YES)"] for row in valid_boundary_rows
+            ]
+
+            ax.scatter(kalshi_x, ssvi_y, alpha=0.8)
+
+            for row in valid_boundary_rows:
+                ax.annotate(
+                    row["Boundary"],
+                    (row["Kalshi P(YES)"], row["SSVI Q(YES)"]),
+                    xytext=(5, 4),
+                    textcoords="offset points",
+                    fontsize=8,
+                )
+
+            ax.plot([0, 1], [0, 1], "--", color="gray", label="Q = Kalshi P")
+            ax.set_xlim(0, 1)
+            ax.set_ylim(0, 1)
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xlabel("Kalshi P(YES), using midpoint when available")
+            ax.set_ylabel("SSVI Q(YES)")
+            ax.set_title("Kalshi odds vs SSVI risk-neutral probability")
+            ax.grid(True, alpha=0.3)
+            ax.legend()
+            fig.tight_layout()
+            st.pyplot(fig, width="stretch")
 
     with kalshi_tab:
         st.pyplot(kalshi_fig, width="stretch")
