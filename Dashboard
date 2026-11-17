@@ -667,7 +667,74 @@ try:
                 reverse=True,
             )
             best = ranked[0]
+            if st.button(
+                f"Load selected candidate ({int(contracts)} Kalshi contracts) "
+                "into simulated trader",
+                key="load_candidate_into_simulator",
+            ):
+                kalshi_outcome = (
+                    "YES"
+                    if best["direction"] == "buy_yes_short_spread"
+                    else "NO"
+                )
+                kalshi_entry = yes_ask if kalshi_outcome == "YES" else no_ask
 
+                if kalshi_entry is None:
+                    st.error("The required Kalshi ask is unavailable.")
+                else:
+                    option_amount = int(contracts) * float(best["amount"])
+
+                    if best["direction"] == "buy_yes_short_spread":
+                        option_specs = [
+                            (best["long"], "Short", best["long"]["bid"]),
+                            (best["short"], "Long", best["short"]["ask"]),
+                        ]
+                    else:
+                        option_specs = [
+                            (best["long"], "Long", best["long"]["ask"]),
+                            (best["short"], "Short", best["short"]["bid"]),
+                        ]
+
+                    suggested_positions = [{
+                        "type": "Kalshi contract",
+                        "contract": ticker,
+                        "outcome": kalshi_outcome,
+                        "side": "Long",
+                        "quantity": int(contracts),
+                        "avg_cost": float(kalshi_entry),
+                        "manual_price": float(kalshi_entry),
+                        "source": "strategy recommendation",
+                    }]
+
+                    for option, option_side, entry_btc in option_specs:
+                        if entry_btc is None:
+                            st.error(
+                                f"An entry quote is missing for {option['name']}."
+                            )
+                            st.stop()
+
+                        entry_usd_per_btc = float(entry_btc) * forward
+                        suggested_positions.append({
+                            "type": "Deribit option",
+                            "contract": option["name"],
+                            "outcome": None,
+                            "side": option_side,
+                            "quantity": option_amount,
+                            "avg_cost": entry_usd_per_btc,
+                            "manual_price": entry_usd_per_btc,
+                            "source": "strategy recommendation",
+                        })
+
+                    # Replace the prior auto-loaded candidate while keeping
+                    # any positions you entered manually.
+                    st.session_state.simulated_positions = [
+                        position
+                        for position in st.session_state.simulated_positions
+                        if position.get("source") != "strategy recommendation"
+                    ] + suggested_positions
+
+                    st.session_state.simulator_view = "workspace"
+                    st.rerun()
             st.subheader("Directional paper screen")
 
             if direction == "buy_yes_short_spread":
